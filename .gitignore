@@ -10,6 +10,7 @@ _build
 build/
 dist/
 crypto_data/
+crypto_data_1min/
 
 *.pkl
 *.hd5
