@@ -23,11 +23,11 @@ pip install -r requirements.txt
 python collector.py download_data --source_dir ~/.qlib/crypto_data/source/1d --start 2015-01-01 --end 2025-03-20 --delay 1 --interval 1d
 
 # normalize daily data
-python collector.py normalize_data --source_dir ~/.qlib/crypto_data/source/1d --normalize_dir ~/.qlib/crypto_data/source/1d_nor --interval 1d --date_field_name date
+python collector.py normalize_data --source_dir /code/crypto_data/source/1d --normalize_dir /code/crypto_data/source/1d_nor --interval 1d --date_field_name date
 
 # dump daily data
 cd qlib/scripts
-python dump_bin.py dump_all --csv_path ~/.qlib/crypto_data/source/1d_nor --qlib_dir ~/.qlib/qlib_data/crypto_data/1d --freq day --date_field_name date --include_fields open,high,low,prices,volume,total_volumes,market_caps
+python dump_bin.py dump_all --csv_path /code/crypto_data/source/1d_nor --qlib_dir /code/qlib_data/crypto_data/1d --freq day --date_field_name date --include_fields open,high,low,prices,volume,total_volumes,market_caps
 ```
 
 #### 1min from Binance
