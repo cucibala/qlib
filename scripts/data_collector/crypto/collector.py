@@ -14,44 +14,44 @@ sys.path.append(str(CUR_DIR.parent.parent))
 from data_collector.base import BaseCollector, BaseNormalize, BaseRun
 from data_collector.utils import deco_retry
 
-from pycoingecko import CoinGeckoAPI
+from binance.client import Client
 from time import mktime
 from datetime import datetime as dt
 import time
 
 
-_CG_CRYPTO_SYMBOLS = None
+_BINANCE_CRYPTO_SYMBOLS = None
 
 
-def get_cg_crypto_symbols(qlib_data_path: [str, Path] = None) -> list:
-    """get crypto symbols in coingecko
+def get_binance_crypto_symbols(qlib_data_path: [str, Path] = None) -> list:
+    """get crypto symbols in binance
 
     Returns
     -------
-        crypto symbols in given exchanges list of coingecko
+        crypto symbols in binance exchange
     """
-    global _CG_CRYPTO_SYMBOLS  # pylint: disable=W0603
+    global _BINANCE_CRYPTO_SYMBOLS  # pylint: disable=W0603
 
     @deco_retry
-    def _get_coingecko():
+    def _get_binance():
         try:
-            cg = CoinGeckoAPI()
-            resp = pd.DataFrame(cg.get_coins_markets(vs_currency="usd"))
-        except Exception as e:
-            raise ValueError("request error") from e
-        try:
-            _symbols = resp["id"].to_list()
+            client = Client()
+            exchange_info = client.get_exchange_info()
+            symbols_info = pd.DataFrame(exchange_info['symbols'])
+            # 过滤出以USDT交易的交易对
+            usdt_symbols = symbols_info[symbols_info['quoteAsset'] == 'USDT']
+            # 获取交易对ID
+            _symbols = usdt_symbols['symbol'].apply(lambda x: x.replace('USDT', '')).to_list()
         except Exception as e:
             logger.warning(f"request error: {e}")
-            raise
+            raise ValueError("request error") from e
         return _symbols
 
-    if _CG_CRYPTO_SYMBOLS is None:
-        _all_symbols = _get_coingecko()
+    if _BINANCE_CRYPTO_SYMBOLS is None:
+        _all_symbols = _get_binance()
+        _BINANCE_CRYPTO_SYMBOLS = sorted(set(_all_symbols))
 
-        _CG_CRYPTO_SYMBOLS = sorted(set(_all_symbols))
-
-    return _CG_CRYPTO_SYMBOLS
+    return _BINANCE_CRYPTO_SYMBOLS
 
 
 class CryptoCollector(BaseCollector):
@@ -103,6 +103,7 @@ class CryptoCollector(BaseCollector):
         )
 
         self.init_datetime()
+        self.client = Client()
 
     def init_datetime(self):
         if self.interval == self.INTERVAL_1min:
@@ -133,21 +134,66 @@ class CryptoCollector(BaseCollector):
     def get_data_from_remote(symbol, interval, start, end):
         error_msg = f"{symbol}-{interval}-{start}-{end}"
         try:
-            cg = CoinGeckoAPI()
-            data = cg.get_coin_market_chart_by_id(id=symbol, vs_currency="usd", days="max")
-            _resp = pd.DataFrame(columns=["date"] + list(data.keys()))
-            _resp["date"] = [dt.fromtimestamp(mktime(time.localtime(x[0] / 1000))) for x in data["prices"]]
-            for key in data.keys():
-                _resp[key] = [x[1] for x in data[key]]
-            _resp["date"] = pd.to_datetime(_resp["date"])
-            _resp["date"] = [x.date() for x in _resp["date"]]
-            _resp = _resp[(_resp["date"] < pd.to_datetime(end).date()) & (_resp["date"] > pd.to_datetime(start).date())]
-            if _resp.shape[0] != 0:
-                _resp = _resp.reset_index()
-            if isinstance(_resp, pd.DataFrame):
-                return _resp.reset_index()
+            client = Client()
+            # 将时间转换为毫秒级时间戳
+            start_ts = int(pd.Timestamp(start).timestamp() * 1000)
+            end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+            
+            # 将qlib的时间间隔映射到币安的时间间隔
+            interval_map = {
+                "1d": Client.KLINE_INTERVAL_1DAY,
+                "1min": Client.KLINE_INTERVAL_1MINUTE,
+                # 可以根据需要添加更多间隔映射
+            }
+            
+            binance_interval = interval_map.get(interval)
+            if not binance_interval:
+                raise ValueError(f"不支持的时间间隔: {interval}")
+            
+            # 获取K线数据
+            klines = client.get_historical_klines(
+                symbol=symbol + "USDT",  # 添加USDT后缀
+                interval=binance_interval,
+                start_str=start_ts,
+                end_str=end_ts
+            )
+            
+            if not klines:
+                logger.warning(f"No data for {error_msg}")
+                return None
+            
+            # 构建数据框
+            df = pd.DataFrame(
+                klines,
+                columns=[
+                    'open_time', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_asset_volume', 'number_of_trades',
+                    'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+                ]
+            )
+            
+            # 转换时间戳为日期时间
+            df['date'] = pd.to_datetime(df['open_time'], unit='ms')
+            df['date'] = df['date'].dt.date
+            
+            # 转换数值列为浮点数
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            
+            # 创建market_cap和total_volumes列模拟CoinGecko数据结构
+            # 币安API不直接提供这些数据，所以我们使用一些替代计算
+            df['market_cap'] = df['close'].astype(float) * df['volume'].astype(float)
+            df['total_volumes'] = df['volume'].astype(float)
+            
+            # 选择所需的列
+            result_df = df[['date', 'market_cap', 'total_volumes', 'close']]
+            result_df.rename(columns={'close': 'prices'}, inplace=True)
+            
+            return result_df
+            
         except Exception as e:
             logger.warning(f"{error_msg}:{e}")
+            return None
 
     def get_data(
         self, symbol: str, interval: str, start_datetime: pd.Timestamp, end_datetime: pd.Timestamp
@@ -171,8 +217,8 @@ class CryptoCollector(BaseCollector):
 
 class CryptoCollector1d(CryptoCollector, ABC):
     def get_instrument_list(self):
-        logger.info("get coingecko crypto symbols......")
-        symbols = get_cg_crypto_symbols()
+        logger.info("get binance crypto symbols......")
+        symbols = get_binance_crypto_symbols()
         logger.info(f"get {len(symbols)} symbols.")
         return symbols
 
@@ -182,6 +228,7 @@ class CryptoCollector1d(CryptoCollector, ABC):
     @property
     def _timezone(self):
         return "Asia/Shanghai"
+
 
 
 class CryptoNormalize(BaseNormalize):
