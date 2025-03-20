@@ -106,24 +106,63 @@ class CryptoCollector(BaseCollector):
         self.client = Client()
 
     def init_datetime(self):
-        if self.interval == self.INTERVAL_1min:
-            self.start_datetime = max(self.start_datetime, self.DEFAULT_START_DATETIME_1MIN)
-        elif self.interval == self.INTERVAL_1d:
-            pass
-        else:
-            raise ValueError(f"interval error: {self.interval}")
+        try:
+            if self.interval == self.INTERVAL_1min:
+                # 将DEFAULT_START_DATETIME_1MIN转换为Timestamp再比较
+                default_start = pd.Timestamp(self.DEFAULT_START_DATETIME_1MIN)
+                self.start_datetime = pd.Timestamp(self.start_datetime) if self.start_datetime else default_start
+                self.start_datetime = max(self.start_datetime, default_start)
+            elif self.interval == self.INTERVAL_1d:
+                # 对于日线数据也进行类型转换以保持一致性
+                if self.start_datetime:
+                    self.start_datetime = pd.Timestamp(self.start_datetime)
+            else:
+                raise ValueError(f"interval error: {self.interval}")
 
-        self.start_datetime = self.convert_datetime(self.start_datetime, self._timezone)
-        self.end_datetime = self.convert_datetime(self.end_datetime, self._timezone)
+            # 确保日期格式一致，都转换为Timestamp
+            self.start_datetime = pd.Timestamp(self.start_datetime)
+            self.end_datetime = pd.Timestamp(self.end_datetime) if self.end_datetime else pd.Timestamp(self.DEFAULT_END_DATETIME_1D)
+            
+            # 进行时区转换
+            self.start_datetime = self.convert_datetime(self.start_datetime, self._timezone)
+            self.end_datetime = self.convert_datetime(self.end_datetime, self._timezone)
+            
+            logger.info(f"Collection period: {self.start_datetime} to {self.end_datetime}")
+        except Exception as e:
+            logger.error(f"初始化日期时出错: {e}")
+            raise
 
     @staticmethod
     def convert_datetime(dt: [pd.Timestamp, datetime.date, str], timezone):
         try:
-            dt = pd.Timestamp(dt, tz=timezone).timestamp()
-            dt = pd.Timestamp(dt, tz=tzlocal(), unit="s")
-        except ValueError as e:
-            pass
-        return dt
+            # 统一处理各种类型的日期输入
+            if dt is None:
+                logger.warning("输入的日期为None，将使用当前时间")
+                dt = pd.Timestamp.now()
+            elif isinstance(dt, str):
+                dt = pd.Timestamp(dt)
+            elif isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
+                dt = pd.Timestamp(dt)
+            
+            # 时区处理
+            if not isinstance(dt, pd.Timestamp):
+                dt = pd.Timestamp(dt)
+                
+            # 添加或转换时区
+            if dt.tzinfo is None:
+                dt = dt.tz_localize(timezone)
+            else:
+                dt = dt.tz_convert(timezone)
+                
+            # 转换为时间戳再转回来，以标准化格式
+            dt_timestamp = dt.timestamp()
+            dt = pd.Timestamp(dt_timestamp, tz=tzlocal(), unit="s")
+            
+            return dt
+        except Exception as e:
+            logger.error(f"日期转换错误: {e}, 输入类型: {type(dt)}, 值: {dt}")
+            # 返回一个默认值而不是直接抛出异常，以增强健壮性
+            return pd.Timestamp.now()
 
     @property
     @abc.abstractmethod
@@ -135,9 +174,15 @@ class CryptoCollector(BaseCollector):
         error_msg = f"{symbol}-{interval}-{start}-{end}"
         try:
             client = Client()
-            # 将时间转换为毫秒级时间戳
-            start_ts = int(pd.Timestamp(start).timestamp() * 1000)
-            end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+            # 将时间转换为毫秒级时间戳，增加异常处理
+            try:
+                start_ts = int(pd.Timestamp(start).timestamp() * 1000)
+                end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+            except Exception as e:
+                logger.error(f"时间戳转换错误: {e}, start: {start}, end: {end}")
+                # 使用默认值
+                start_ts = int((pd.Timestamp.now() - pd.Timedelta(days=7)).timestamp() * 1000)
+                end_ts = int(pd.Timestamp.now().timestamp() * 1000)
             
             # 将qlib的时间间隔映射到币安的时间间隔
             interval_map = {
@@ -172,27 +217,34 @@ class CryptoCollector(BaseCollector):
                 ]
             )
             
-            # 转换时间戳为日期时间
+            # 转换时间戳为日期时间，统一使用pd.Timestamp
             df['date'] = pd.to_datetime(df['open_time'], unit='ms')
-            df['date'] = df['date'].dt.date
             
-            # 转换数值列为浮点数
+            # 转换数值列为浮点数，添加错误处理
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
+                try:
+                    df[col] = df[col].astype(float)
+                except Exception as e:
+                    logger.warning(f"转换列 {col} 为浮点数失败: {e}")
+                    df[col] = df[col].astype(str).str.replace(',', '').astype(float)
             
             # 创建market_cap和total_volumes列模拟CoinGecko数据结构
-            # 币安API不直接提供这些数据，所以我们使用一些替代计算
-            df['market_cap'] = df['close'].astype(float) * df['volume'].astype(float)
-            df['total_volumes'] = df['volume'].astype(float)
+            try:
+                df['market_cap'] = df['close'].astype(float) * df['volume'].astype(float)
+                df['total_volumes'] = df['volume'].astype(float)
+            except Exception as e:
+                logger.warning(f"计算market_cap或total_volumes失败: {e}")
+                df['market_cap'] = 0.0
+                df['total_volumes'] = 0.0
             
-            # 选择所需的列
-            result_df = df[['date', 'market_cap', 'total_volumes', 'close']]
+            # 选择所需的列并添加OHLC列
+            result_df = df[['date', 'market_cap', 'total_volumes', 'close', 'open', 'high', 'low', 'volume']]
             result_df.rename(columns={'close': 'prices'}, inplace=True)
             
             return result_df
             
         except Exception as e:
-            logger.warning(f"{error_msg}:{e}")
+            logger.error(f"{error_msg}:{e}")
             return None
 
     def get_data(
@@ -208,7 +260,7 @@ class CryptoCollector(BaseCollector):
                 end=end_,
             )
 
-        if interval == self.INTERVAL_1d:
+        if interval == self.INTERVAL_1d or interval == self.INTERVAL_1min:
             _result = _get_simple(start_datetime, end_datetime)
         else:
             raise ValueError(f"cannot support {interval}")
@@ -230,9 +282,24 @@ class CryptoCollector1d(CryptoCollector, ABC):
         return "Asia/Shanghai"
 
 
+class CryptoCollector1min(CryptoCollector, ABC):
+    def get_instrument_list(self):
+        logger.info("get binance crypto symbols for 1min data......")
+        symbols = get_binance_crypto_symbols()
+        logger.info(f"get {len(symbols)} symbols.")
+        return symbols
+
+    def normalize_symbol(self, symbol):
+        return symbol
+
+    @property
+    def _timezone(self):
+        return "Asia/Shanghai"
+
 
 class CryptoNormalize(BaseNormalize):
     DAILY_FORMAT = "%Y-%m-%d"
+    MINUTE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
     @staticmethod
     def normalize_crypto(
@@ -240,33 +307,81 @@ class CryptoNormalize(BaseNormalize):
         calendar_list: list = None,
         date_field_name: str = "date",
         symbol_field_name: str = "symbol",
+        interval: str = "1d",
     ):
-        if df.empty:
-            return df
-        df = df.copy()
-        df.set_index(date_field_name, inplace=True)
-        df.index = pd.to_datetime(df.index)
-        df = df[~df.index.duplicated(keep="first")]
-        if calendar_list is not None:
-            df = df.reindex(
-                pd.DataFrame(index=calendar_list)
-                .loc[
-                    pd.Timestamp(df.index.min()).date() : pd.Timestamp(df.index.max()).date()
-                    + pd.Timedelta(hours=23, minutes=59)
-                ]
-                .index
-            )
-        df.sort_index(inplace=True)
-
-        df.index.names = [date_field_name]
-        return df.reset_index()
+        if df is None or df.empty:
+            logger.warning("输入数据为空")
+            return pd.DataFrame()
+            
+        try:
+            df = df.copy()
+            
+            # 确保日期字段存在
+            if date_field_name not in df.columns:
+                logger.error(f"数据中找不到日期字段: {date_field_name}")
+                return pd.DataFrame()
+            
+            # 确保日期字段是一致的类型
+            try:
+                df[date_field_name] = pd.to_datetime(df[date_field_name])
+            except Exception as e:
+                logger.error(f"日期转换失败: {e}")
+                return pd.DataFrame()
+                
+            df.set_index(date_field_name, inplace=True)
+            df.index = pd.to_datetime(df.index)
+            df = df[~df.index.duplicated(keep="first")]
+            
+            if calendar_list is not None:
+                try:
+                    # 确保calendar_list中的日期是datetime类型
+                    calendar_list = pd.to_datetime(calendar_list)
+                    min_date = pd.Timestamp(df.index.min())
+                    max_date = pd.Timestamp(df.index.max()) + pd.Timedelta(hours=23, minutes=59)
+                    
+                    df = df.reindex(
+                        pd.DataFrame(index=calendar_list)
+                        .loc[min_date:max_date]
+                        .index
+                    )
+                except Exception as e:
+                    logger.error(f"重索引失败: {e}")
+                    # 不进行重索引，继续处理
+            
+            df.sort_index(inplace=True)
+            df.index.names = [date_field_name]
+            
+            return df.reset_index()
+            
+        except Exception as e:
+            logger.error(f"数据标准化过程中出错: {e}")
+            return pd.DataFrame()
 
     def normalize(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = self.normalize_crypto(df, self._calendar_list, self._date_field_name, self._symbol_field_name)
+        df = self.normalize_crypto(
+            df,
+            self._calendar_list,
+            self._date_field_name,
+            self._symbol_field_name,
+            getattr(self, "interval", "1d"),
+        )
         return df
 
 
 class CryptoNormalize1d(CryptoNormalize):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.interval = "1d"
+        
+    def _get_calendar_list(self):
+        return None
+
+
+class CryptoNormalize1min(CryptoNormalize):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.interval = "1min"
+        
     def _get_calendar_list(self):
         return None
 
@@ -318,7 +433,7 @@ class Run(BaseRun):
         delay: float
             time.sleep(delay), default 0
         interval: str
-            freq, value from [1min, 1d], default 1d, currently only supprot 1d
+            freq, value from [1min, 1d], default 1d
         start: str
             start datetime, default "2000-01-01"
         end: str
@@ -332,6 +447,9 @@ class Run(BaseRun):
         ---------
             # get daily data
             $ python collector.py download_data --source_dir ~/.qlib/crypto_data/source/1d --start 2015-01-01 --end 2021-11-30 --delay 1 --interval 1d
+            
+            # get 1min data
+            $ python collector.py download_data --source_dir ~/.qlib/crypto_data/source/1min --start 2023-01-01 --end 2023-01-31 --delay 1 --interval 1min
         """
 
         super(Run, self).download_data(max_collector_count, delay, start, end, check_data_length, limit_nums)
@@ -348,7 +466,11 @@ class Run(BaseRun):
 
         Examples
         ---------
+            # normalize daily data
             $ python collector.py normalize_data --source_dir ~/.qlib/crypto_data/source/1d --normalize_dir ~/.qlib/crypto_data/source/1d_nor --interval 1d --date_field_name date
+            
+            # normalize 1min data
+            $ python collector.py normalize_data --source_dir ~/.qlib/crypto_data/source/1min --normalize_dir ~/.qlib/crypto_data/source/1min_nor --interval 1min --date_field_name date
         """
         super(Run, self).normalize_data(date_field_name, symbol_field_name)
 
