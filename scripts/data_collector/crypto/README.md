@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 ```bash
 # download daily data from Binance API
-python collector.py download_data --source_dir ~/.qlib/crypto_data/source/1d --start 2015-01-01 --end 2025-03-20 --delay 1 --interval 1d
+python collector.py download_data --source_dir /code/crypto_data/source/1d --start 2021-01-01 --end 2025-03-15 --delay 1 --interval 1d
 
 # normalize daily data
 python collector.py normalize_data --source_dir /code/crypto_data/source/1d --normalize_dir /code/crypto_data/source/1d_nor --interval 1d --date_field_name date

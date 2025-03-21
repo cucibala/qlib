@@ -144,25 +144,39 @@ class CryptoCollector(BaseCollector):
             elif isinstance(dt, datetime.date) and not isinstance(dt, datetime.datetime):
                 dt = pd.Timestamp(dt)
             
-            # 时区处理
+            # 确保转换为Timestamp类型
             if not isinstance(dt, pd.Timestamp):
                 dt = pd.Timestamp(dt)
-                
-            # 添加或转换时区
-            if dt.tzinfo is None:
-                dt = dt.tz_localize(timezone)
-            else:
-                dt = dt.tz_convert(timezone)
-                
-            # 转换为时间戳再转回来，以标准化格式
-            dt_timestamp = dt.timestamp()
-            dt = pd.Timestamp(dt_timestamp, tz=tzlocal(), unit="s")
+            
+            # 时区处理 - 安全地添加或转换时区
+            try:
+                # 如果已有时区信息
+                if dt.tzinfo is not None:
+                    # 转换到目标时区
+                    dt = dt.tz_convert(timezone)
+                else:
+                    # 添加时区信息
+                    dt = dt.tz_localize(timezone)
+            except Exception as e:
+                logger.warning(f"时区转换失败: {e}，将使用无时区的时间戳")
+                # 如果时区转换失败，移除时区信息以避免比较问题
+                if dt.tzinfo is not None:
+                    dt = dt.tz_localize(None)
+            
+            # 特别注意：tzlocal()可能在某些环境中不稳定，这里使用更明确的做法
+            try:
+                # 转换为UTC时间戳然后转回带时区的Timestamp
+                dt_timestamp = dt.timestamp()
+                # 使用固定的时区而非tzlocal()以增强稳定性
+                dt = pd.Timestamp(dt_timestamp, tz='UTC', unit="s")
+            except Exception as e:
+                logger.warning(f"时间戳转换失败: {e}，将保持原始时间格式")
             
             return dt
         except Exception as e:
             logger.error(f"日期转换错误: {e}, 输入类型: {type(dt)}, 值: {dt}")
-            # 返回一个默认值而不是直接抛出异常，以增强健壮性
-            return pd.Timestamp.now()
+            # 返回一个安全的默认值
+            return pd.Timestamp.now(tz='UTC')
 
     @property
     @abc.abstractmethod
@@ -220,26 +234,82 @@ class CryptoCollector(BaseCollector):
             # 转换时间戳为日期时间，统一使用pd.Timestamp
             df['date'] = pd.to_datetime(df['open_time'], unit='ms')
             
-            # 转换数值列为浮点数，添加错误处理
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                try:
-                    df[col] = df[col].astype(float)
-                except Exception as e:
-                    logger.warning(f"转换列 {col} 为浮点数失败: {e}")
-                    df[col] = df[col].astype(str).str.replace(',', '').astype(float)
-            
             # 创建market_cap和total_volumes列模拟CoinGecko数据结构
             try:
-                df['market_cap'] = df['close'].astype(float) * df['volume'].astype(float)
-                df['total_volumes'] = df['volume'].astype(float)
+                # 添加复权因子列，统一设置为1
+                df['factor'] = 1.0
+                
+                # 转换所有数值列为浮点型，确保类型一致
+                numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'factor']
+                for col in numeric_cols:
+                    df[col] = df[col].astype(float)
+                    
             except Exception as e:
-                logger.warning(f"计算market_cap或total_volumes失败: {e}")
-                df['market_cap'] = 0.0
-                df['total_volumes'] = 0.0
+                logger.warning(f"添加复权因子失败: {e}")
+                df['factor'] = 1.0
             
-            # 选择所需的列并添加OHLC列
-            result_df = df[['date', 'market_cap', 'total_volumes', 'close', 'open', 'high', 'low', 'volume']]
-            result_df.rename(columns={'close': 'prices'}, inplace=True)
+            # 只选择所需的列：日期、开盘价、收盘价、最高价、最低价、成交量和复权因子
+            result_df = df[['date', 'open', 'close', 'high', 'low', 'volume', 'factor']]
+            
+            # 检查实际数据的日期范围
+            # 确保时区一致性 - 将输入的start/end时间转换为时区感知的时间戳
+            try:
+                # 统一转换为UTC时区的时间戳，避免时区比较问题
+                if isinstance(start, str):
+                    requested_start = pd.to_datetime(start)
+                else:
+                    requested_start = pd.Timestamp(start)
+                
+                if isinstance(end, str):
+                    requested_end = pd.to_datetime(end)
+                else:
+                    requested_end = pd.Timestamp(end)
+                
+                # 确保时区一致 - 如果是带时区的，保留时区；如果没有时区，不添加时区
+                # 这样在后续比较时会自动处理时区问题
+            except Exception as e:
+                logger.error(f"日期格式转换错误: {e}, start: {start}, end: {end}")
+                # 使用安全的默认值
+                requested_start = pd.Timestamp.now() - pd.Timedelta(days=30)
+                requested_end = pd.Timestamp.now()
+            
+            # 检查实际数据与请求的数据范围是否有显著差异
+            if not result_df.empty:
+                # 确保'date'列没有时区信息，以便于比较
+                actual_start = pd.to_datetime(result_df['date'].min()).tz_localize(None)
+                actual_end = pd.to_datetime(result_df['date'].max()).tz_localize(None)
+                
+                # 移除请求时间的时区信息，以便于比较
+                if requested_start.tzinfo is not None:
+                    requested_start = requested_start.tz_localize(None)
+                if requested_end.tzinfo is not None:
+                    requested_end = requested_end.tz_localize(None)
+                
+                # 计算日期范围重叠率，使用更宽松的验证
+                try:
+                    requested_range = (requested_end - requested_start).total_seconds()
+                    if requested_range > 0:
+                        actual_range = (actual_end - actual_start).total_seconds()
+                        overlap_start = max(actual_start, requested_start)
+                        overlap_end = min(actual_end, requested_end)
+                        
+                        if overlap_end > overlap_start:
+                            overlap_range = (overlap_end - overlap_start).total_seconds()
+                            overlap_ratio = overlap_range / requested_range
+                            
+                            # 仅记录覆盖率信息，但不强制要求完全覆盖
+                            logger.info(f"{symbol} 数据覆盖率: {overlap_ratio:.2%}，实际日期范围: {actual_start} 至 {actual_end}")
+                        else:
+                            # 没有重叠也接受，只是记录一个警告
+                            logger.warning(f"{symbol} 数据范围与请求范围没有重叠，但仍保存数据")
+                except Exception as e:
+                    logger.error(f"计算日期重叠率错误: {e}")
+                
+                # 如果数据点太少，还是不保存
+                min_data_points = 5  # 降低最小数据点数量要求
+                if len(result_df) < min_data_points:
+                    logger.warning(f"{symbol} 数据点太少 ({len(result_df)} < {min_data_points})，不保存")
+                    return None
             
             return result_df
             
@@ -262,9 +332,121 @@ class CryptoCollector(BaseCollector):
 
         if interval == self.INTERVAL_1d or interval == self.INTERVAL_1min:
             _result = _get_simple(start_datetime, end_datetime)
+            
+            # 如果获取到数据，验证数据的有效范围
+            if _result is not None and not _result.empty:
+                try:
+                    # 确保'date'列没有时区信息，以便于比较
+                    actual_start = pd.to_datetime(_result['date'].min()).tz_localize(None)
+                    actual_end = pd.to_datetime(_result['date'].max()).tz_localize(None)
+                    
+                    # 移除请求时间的时区信息，以便于比较
+                    start_dt = start_datetime.tz_localize(None) if start_datetime.tzinfo is not None else start_datetime
+                    end_dt = end_datetime.tz_localize(None) if end_datetime.tzinfo is not None else end_datetime
+                    
+                    # 计算重叠率，但不强制要求完全覆盖
+                    requested_range = (end_dt - start_dt).total_seconds()
+                    if requested_range > 0:
+                        overlap_start = max(actual_start, start_dt)
+                        overlap_end = min(actual_end, end_dt)
+                        
+                        # 检查是否有重叠
+                        if overlap_end > overlap_start:
+                            overlap_range = (overlap_end - overlap_start).total_seconds()
+                            coverage_ratio = overlap_range / requested_range
+                            
+                            # 只记录覆盖率信息，不作为筛选条件
+                            logger.info(f"{symbol} 数据覆盖率: {coverage_ratio:.2%}，实际日期范围: {actual_start} 至 {actual_end}")
+                        else:
+                            # 没有重叠，只记录警告，但仍然保存数据
+                            logger.warning(f"{symbol} 数据范围与请求范围没有重叠。请求范围: {start_dt} - {end_dt}, 实际范围: {actual_start} - {actual_end}")
+                    
+                    # 检查数据点数量是否足够
+                    min_data_points = 10  # 设置合理的最小数据点数量
+                    if len(_result) < min_data_points:
+                        logger.warning(f"{symbol} 数据点太少 ({len(_result)} < {min_data_points})，不保存")
+                        return None
+                    
+                    # 记录数据范围
+                    logger.info(f"{symbol} 数据范围: {actual_start} 至 {actual_end}, 数据点数量: {len(_result)}")
+                except Exception as e:
+                    # 捕获所有处理中的异常，但仍然尝试保存数据
+                    logger.error(f"{symbol} 数据验证过程中出错: {e}")
+                    # 异常不影响数据保存
+            
+            return _result
         else:
             raise ValueError(f"cannot support {interval}")
-        return _result
+
+    def save_instrument(self, symbol, df: pd.DataFrame):
+        """save instrument data to file
+
+        Parameters
+        ----------
+        symbol: str
+            instrument code
+        df : pd.DataFrame
+            df.columns must contain "symbol" and "datetime"
+        """
+        if df is None or df.empty:
+            logger.warning(f"{symbol} is empty")
+            return
+
+        symbol = self.normalize_symbol(symbol)
+        # symbol = code_to_fname(symbol)
+        instrument_path = self.save_dir.joinpath(f"{symbol}.csv")
+        df["symbol"] = symbol
+        
+        # 确保数据包含必要的列
+        required_columns = ['open', 'close', 'high', 'low', 'volume', 'factor']
+        for col in required_columns:
+            if col not in df.columns:
+                if col == 'factor':
+                    df[col] = 1.0  # 添加默认的复权因子
+                else:
+                    logger.error(f"{symbol} 数据缺少必要的列: {col}")
+                    return
+        
+        if instrument_path.exists():
+            try:
+                _old_df = pd.read_csv(instrument_path)
+                
+                # 检查旧数据是否有更改列名的需要
+                old_format = False
+                if 'prices' in _old_df.columns and 'close' not in _old_df.columns:
+                    _old_df.rename(columns={'prices': 'close'}, inplace=True)
+                    old_format = True
+                
+                # 检查旧数据是否缺少factor列
+                if 'factor' not in _old_df.columns:
+                    _old_df['factor'] = 1.0
+                    old_format = True
+                
+                # 移除不需要的列
+                columns_to_keep = ['date', 'symbol', 'open', 'close', 'high', 'low', 'volume', 'factor']
+                extra_columns = [col for col in _old_df.columns if col not in columns_to_keep]
+                if extra_columns:
+                    _old_df = _old_df[[col for col in _old_df.columns if col in columns_to_keep]]
+                    old_format = True
+                
+                if old_format:
+                    logger.info(f"更新 {symbol} 的数据格式")
+                
+                # 合并新旧数据
+                df = pd.concat([_old_df, df], sort=False)
+                
+            except Exception as e:
+                logger.error(f"读取或处理旧数据时出错: {e}")
+        
+        # 只保存需要的列
+        columns_to_save = ['date', 'symbol', 'open', 'close', 'high', 'low', 'volume', 'factor']
+        df = df[[col for col in columns_to_save if col in df.columns]]
+        
+        # 去重并排序
+        df = df.drop_duplicates(subset=['date']).sort_values(by=['date'])
+        
+        # 保存
+        df.to_csv(instrument_path, index=False)
 
 
 class CryptoCollector1d(CryptoCollector, ABC):
@@ -327,6 +509,18 @@ class CryptoNormalize(BaseNormalize):
             except Exception as e:
                 logger.error(f"日期转换失败: {e}")
                 return pd.DataFrame()
+            
+            # 确保必要的列都存在
+            required_columns = ['open', 'close', 'high', 'low', 'volume', 'factor']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                logger.error(f"数据中缺少必要的列: {', '.join(missing_columns)}")
+                # 如果缺少factor列，添加默认值1
+                if 'factor' in missing_columns and len(missing_columns) == 1:
+                    logger.warning("添加默认的复权因子列")
+                    df['factor'] = 1.0
+                else:
+                    return pd.DataFrame()
                 
             df.set_index(date_field_name, inplace=True)
             df.index = pd.to_datetime(df.index)
